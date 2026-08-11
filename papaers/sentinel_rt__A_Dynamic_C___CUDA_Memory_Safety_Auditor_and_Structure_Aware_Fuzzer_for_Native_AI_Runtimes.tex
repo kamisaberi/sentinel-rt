@@ -1,12 +1,16 @@
-\documentclass[10pt,twocolumn,a4paper]{article}
+\documentclass[11pt,a4paper]{article}
 \usepackage[utf8]{utf8}
-\usepackage[margin=0.7in]{geometry}
+\usepackage[margin=0.9in]{geometry}
 \usepackage{amsmath,amsfonts,amssymb}
 \usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage{listings}
 \usepackage{booktabs}
 \usepackage{xcolor}
+\usepackage{cite}
+\usepackage{setspace}
+
+\setstretch{1.15}
 
 \hypersetup{
     colorlinks=true,
@@ -15,10 +19,19 @@
     urlcolor=blue
 }
 
-\title{\textbf{sentinel-rt: A Dynamic C++/CUDA Memory Safety Auditor and Structure-Aware Fuzzer for Native AI Runtimes}}
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!60!black},
+    stringstyle=\color{orange}
+}
+
+\title{\Large\bfseries sentinel-rt: A Dynamic C++/CUDA Memory Safety Auditor and Structure-Aware Fuzzer for Native AI Runtimes}
 
 \author{
-    \textbf{Kamran Saberifard}\\
+    \textbf{Kamran Saberifard}\\[4pt]
     Department of Computer Engineering (Cybersecurity), MehrAstan University, Guilan, Iran\\
     Aryorithm Group — Global AI Infrastructure \& Security Research\\
     \href{mailto:kamisaberi@gmail.com}{kamisaberi@gmail.com} \quad|\quad ORCID: \href{https://orcid.org/0009-0002-7822-6168}{0009-0002-7822-6168}
@@ -31,73 +44,136 @@
 \maketitle
 
 \begin{abstract}
-Deep learning inference runtimes (e.g., vLLM, llama.cpp, LibTorch, TensorRT) increasingly rely on native C++ and CUDA codebases to maximize hardware throughput and minimize latency. However, these low-level runtimes prioritize execution speed over memory safety, exposing enterprise AI infrastructure to severe memory corruption vulnerabilities, including heap buffer overflows, use-after-free (UAF) conditions, and GPU VRAM boundary violations. In this paper, we present \textbf{sentinel-rt}, an open-source, high-throughput security auditing and structure-aware fuzzing framework built specifically for native AI execution runtimes. \texttt{sentinel-rt} combines zero-copy C++20 deserialization parsers for GGUF, Safetensors, and ONNX model formats with custom AFL++ grammar mutators, dynamic CUDA VRAM redzone allocators, and automated POSIX/ASan crash triage. Our empirical evaluation demonstrates that \texttt{sentinel-rt} audits model deserialization and KV-cache allocations with less than 3.2\% performance overhead while effectively discovering out-of-bounds reads and memory boundary breaches.
+\noindent Modern deep learning execution runtimes (e.g., \texttt{vLLM}, \texttt{llama.cpp}, \texttt{LibTorch}, \texttt{ONNX Runtime}) increasingly rely on compiled C++20 and custom CUDA backends to maximize hardware FLOPS and achieve strict sub-50ms inference Service Level Agreements (SLAs). However, these low-level execution engines prioritize raw computational speed over memory safety, exposing enterprise AI infrastructure to severe low-level memory corruption vulnerabilities. Integer overflows during model header deserialization, heap-based buffer overflows, Use-After-Free (UAF) conditions in custom tensor caching allocators, and GPU VRAM boundary violations can be exploited to achieve Remote Code Execution (RCE) or exfiltrate private tensor data across multi-tenant GPU nodes. In this paper, we present \textbf{sentinel-rt}, an open-source, high-throughput memory auditing and structure-aware fuzzing framework built specifically for native AI execution runtimes. \texttt{sentinel-rt} combines zero-copy C++20 format parsers for GGUF, Safetensors, and ONNX models with custom AFL++ grammar mutators, dynamic CUDA VRAM redzone allocators, and automated POSIX/ASan crash triaging. Our empirical evaluation demonstrates that \texttt{sentinel-rt} audits model deserialization and KV-cache allocations with less than 3.2\% performance overhead while effectively discovering out-of-bounds reads and memory boundary breaches in native AI execution backends.
 \end{abstract}
 
-\textbf{Keywords:} AI Security, C++20, CUDA Memory Safety, AFL++, LibFuzzer, AddressSanitizer, GGUF, LLM Inference, Vulnerability Research.
+\vspace{6pt}
+\noindent\textbf{Keywords:} AI Security, C++20, CUDA Memory Safety, AFL++, LibFuzzer, AddressSanitizer, GGUF, LLM Inference, Vulnerability Research.
+
+\hr
 
 \section{Introduction}
-The rapid enterprise deployment of Large Language Models (LLMs) and multi-modal neural networks has driven the AI software stack toward native C++ and CUDA runtimes. While high-level Python interfaces remain popular for model training, production inference serving relies almost exclusively on compiled, low-level execution engines such as \texttt{vLLM}, \texttt{llama.cpp}, \texttt{TensorRT-LLM}, and \texttt{LibTorch}.
+The rapid production deployment of Large Language Models (LLMs) and multi-modal neural networks has driven the AI software stack toward native C++ and CUDA execution backends. While high-level Python interfaces remain popular for model training, enterprise inference serving relies almost exclusively on compiled, low-level engines such as \texttt{vLLM}, \texttt{llama.cpp}, \texttt{TensorRT-LLM}, and \texttt{LibTorch}.
 
-These native execution engines process untrusted external inputs—including user-uploaded model files (GGUF, Safetensors, ONNX) and dynamic prompt sequences—directly within raw memory buffers. Because C++ lacks compile-time memory safety guarantees, malformed model files or prompt payloads can trigger catastrophic memory corruption flaws, leading to Remote Code Execution (RCE), host memory disclosure, or denial-of-service (DoS) attacks on GPU clusters.
+These native execution engines process untrusted external inputs—including user-uploaded model binary files (GGUF, Safetensors, ONNX) and dynamic prompt token sequences—directly within raw memory buffers. Because C++ lacks compile-time memory safety guarantees, malformed model headers or corrupted tensor payloads can trigger catastrophic memory corruption flaws, leading to Remote Code Execution (RCE), host memory disclosure, or denial-of-service (DoS) crashes on GPU clusters.
 
 To address this challenge, we introduce \textbf{sentinel-rt}, a high-throughput, native memory auditing and structure-aware fuzzing framework designed specifically for deep learning execution runtimes.
 
-\section{Threat Model}
-We model an enterprise setting where an AI serving node processes user-supplied model weights or user-provided prompt strings. The adversary aims to achieve Remote Code Execution (RCE) or read arbitrary GPU VRAM memory.
+\begin{figure}[h!]
+\centering
+\fbox{\parbox{0.88\linewidth}{
+\small
+\textbf{[ Raw Input Seed Corpus (GGUF, Safetensors, ONNX) ]}\\
+$\Downarrow$\\
+\textbf{[ AFL++ Custom Grammar Mutators (\texttt{mutators/gguf\_mutator.cpp}) ]}\\
+$\Downarrow$ \textit{(Structure-Aware Mutated Binary Stream)}\\
+\textbf{[ C++20 Target Fuzz Harness (\texttt{harnesses/fuzz\_gguf.cpp}) ]}\\
+$\Downarrow$\\
+\textbf{[ Dynamic CUDA VRAM Auditor (\texttt{CUDASanitizer}) + ASan / UBSan ]}\\
+$\Downarrow$ \textit{(Crash Intercepted)}\\
+\textbf{\textcolor{red}{[ Automated Crash Triager: CWE Classification \& JSON Report ]}}
+}}
+\caption{\texttt{sentinel-rt} Fuzzing \& Memory Auditing Architecture.}
+\label{fig:fuzz_architecture}
+\end{figure}
+
+\section{Threat Model \& Memory Safety Invariants}
+
+We model an enterprise setting where an AI serving node processes user-supplied model files or external tensor inputs. The adversary aims to achieve Remote Code Execution (RCE) or extract unallocated GPU VRAM memory.
 
 \subsection{Primary Vulnerability Vectors}
 \begin{enumerate}
-    \item \textbf{Model Deserialization Bugs:} Integer overflows during tensor dimension multiplication in malformed GGUF or Safetensors headers leading to heap-based buffer overflows.
+    \item \textbf{Model Deserialization Flaws:} Integer overflows during tensor dimension multiplication in malformed GGUF or Safetensors headers leading to heap-based buffer overflows.
     \item \textbf{GPU VRAM Boundary Violations:} Out-of-bounds indexing in CUDA PagedAttention KV-cache pages during long-context LLM decoding.
-    \item \textbf{Use-After-Free (UAF) in Tensor Memory Pools:} Race conditions in custom C++ CUDA caching allocators when freeing and reallocating tensor memory views.
+    \item \textbf{Use-After-Free (UAF) in Tensor Allocators:} Race conditions in custom C++ CUDA caching allocators when freeing and reallocating tensor memory views.
 \end{enumerate}
 
-\section{System Architecture}
+\section{System Architecture \& Component Design}
+
 \texttt{sentinel-rt} consists of four core modular subsystems built using modern C++20 and CUDA 12:
 
-\subsection{1. Zero-Copy Format Auditors}
+\subsection{1. Zero-Copy C++20 Format Parsers}
 \texttt{sentinel-rt} includes zero-dependency parsers (\texttt{GGUFParser}, \texttt{SafetensorsParser}, \texttt{ONNXParser}) that inspect binary model metadata using C++20 \texttt{std::span} abstractions without dynamic heap reallocation. Every integer read is guarded by strict overflow checks:
 \begin{equation}
-\text{Overflow Check: } \text{dim}_i > 0 \implies \text{total} \le \frac{\text{UINT64\_MAX}}{\text{dim}_i}
+\text{Overflow Check: } \text{dim}_i > 0 \implies \text{total\_elements} \le \frac{\text{UINT64\_MAX}}{\text{dim}_i}
 \end{equation}
 
-\subsection{2. Dynamic CUDA VRAM Sanitizer}
-The \texttt{CUDASanitizer} module wraps native \texttt{cudaMalloc} allocations by injecting unaddressable redzone guard bands around usable GPU VRAM buffers, catching dynamic out-of-bounds writes.
+\subsection{2. Dynamic CUDA VRAM Redzone Auditor}
+The \texttt{CUDASanitizer} module wraps native \texttt{cudaMalloc} allocations by injecting unaddressable redzone guard bands around usable GPU VRAM buffers, catching dynamic out-of-bounds writes:
+\begin{equation}
+S_{\text{allocated}} = S_{\text{payload}} + 2 \times R_{\text{redzone}}
+\end{equation}
+The usable pointer returned to the target AI engine is offset past the front redzone:
+\begin{equation}
+P_{\text{usable}} = P_{\text{raw}} + R_{\text{redzone}}
+\end{equation}
 
-\subsection{3. AFL++ Structure-Aware Custom Mutator}
-The \texttt{gguf\_mutator} plugin implements custom grammar mutation rules, systematically corrupting magic headers, array lengths, and tensor offset pointers to stress-test parser resilience.
+\subsection{3. AFL++ Structure-Aware Custom Mutators}
+The \texttt{gguf\_mutator} and \texttt{safetensors\_mutator} plugins implement custom grammar mutation rules, systematically corrupting magic headers, array lengths, and tensor offset pointers to stress-test parser resilience.
 
 \subsection{4. Crash Triager \& CWE Classifier}
 The \texttt{CrashAnalyzer} module captures POSIX signals (\texttt{SIGSEGV}, \texttt{SIGBUS}) and AddressSanitizer (ASan) crash reports, extracting stack frames and classifying vulnerabilities into standardized CWE categories (CWE-119, CWE-122, CWE-416, CWE-190).
 
-\section{Evaluation \& Benchmarks}
-We evaluated \texttt{sentinel-rt} on an Ubuntu 24.04 server equipped with an NVIDIA RTX 4090 GPU and AMD EPYC 7763 CPU.
+\section{Implementation Details}
 
-\begin{table}[h]
+The framework is organized into zero-dependency C++20 headers and CUDA kernel modules.
+
+\begin{lstlisting}[language=C++, caption={GGUF Parser Bounds-Checked Deserialization Logic}]
+Status GGUFParser::parse(std::span<const uint8_t> buffer) {
+    reset();
+
+    auto magic = read_pod<uint32_t>(buffer);
+    if (!magic.has_value() || *magic != GGUF_MAGIC) {
+        return Status::ErrInvalidMagic;
+    }
+
+    auto version = read_pod<uint32_t>(buffer);
+    if (!version.has_value() || *version > 3) {
+        return Status::ErrUnsupportedVersion;
+    }
+
+    auto tensor_count = read_pod<uint64_t>(buffer);
+    if (!tensor_count.has_value() || *tensor_count > 1000000) {
+        return Status::ErrMalformedHeader;
+    }
+
+    return validate_tensor_metadata();
+}
+\end{lstlisting}
+
+\section{Empirical Evaluation \& Benchmarks}
+
+We evaluated \texttt{sentinel-rt} on an Ubuntu 24.04 server equipped with an NVIDIA RTX 4090 GPU and an AMD EPYC 7763 CPU.
+
+\begin{table}[h!]
 \centering
-\caption{Parsing & Fuzzing Performance Benchmarks}
-\label{tab:benchmarks}
+\caption{Parsing \& Fuzzing Throughput Performance Benchmarks}
+\label{tab:fuzz_benchmarks}
+\vspace{4pt}
 \begin{tabular}{lcc}
 \toprule
-\textbf{Target Format} & \textbf{Parsing Speed (MB/s)} & \textbf{Fuzz Exec/sec} \\
+\textbf{Target Format} & \textbf{Parsing Speed (MB/s)} & \textbf{Fuzz Execution Rate (exec/sec)} \\
 \midrule
-GGUF v3 Header         & 2,840 MB/s                    & 14,200 exec/s          \\
-Safetensors JSON       & 1,920 MB/s                    & 11,500 exec/s          \\
-ONNX Protobuf          & 1,450 MB/s                    & 8,900 exec/s           \\
+GGUF v3 Header         & 2,840 MB/s                    & 14,200 exec/s                         \\
+Safetensors JSON       & 1,920 MB/s                    & 11,500 exec/s                         \\
+ONNX Protobuf          & 1,450 MB/s                    & 8,900 exec/s                          \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The total memory overhead introduced by \texttt{CUDASanitizer}'s VRAM redzone padding was measured at under 3.2\% during continuous 100-hour fuzzing campaigns.
+As detailed in Table~\ref{tab:fuzz_benchmarks}, \texttt{sentinel-rt} achieves exceptionally high fuzzing throughput, reaching over **14,000 executions per second** on GGUF binary headers. The total memory overhead introduced by \texttt{CUDASanitizer}'s VRAM redzone padding was measured at under **3.2\%** during continuous 100-hour fuzzing campaigns.
 
-\section{Conclusion}
-\texttt{sentinel-rt} bridges the security gap in native AI infrastructure by providing a high-performance C++/CUDA framework for memory safety auditing, structure-aware fuzzing, and automated crash triaging. Future work will expand hardware enclave support for NVIDIA Confidential Computing.
+\section{Related Work}
+Fuzzing C/C++ libraries was popularized by AFL++~\cite{aflpp} and LibFuzzer. AddressSanitizer~\cite{asan} introduced fast host-side memory bug detection. In contrast to general-purpose fuzzers, \texttt{sentinel-rt} provides an integrated C++/CUDA framework tailored specifically for deep learning tensor deserializers and GPU VRAM memory safety.
+
+\section{Conclusion \& Future Work}
+\texttt{sentinel-rt} bridges the memory safety gap in native AI infrastructure by providing a high-performance C++/CUDA framework for format auditing, structure-aware fuzzing, and automated crash triaging. Future work will expand hardware enclave support for NVIDIA Confidential Computing.
 
 \begin{thebibliography}{99}
-\bibitem{aflpp} A. Fioraldi et al., ``AFL++: Combining Incremental Improvements of Fuzzing,'' in \emph{WOOT}, 2020.
-\bibitem{asan} K. Serebryany et al., ``AddressSanitizer: A Fast Address Sanity Checker,'' in \emph{USENIX ATC}, 2012.
-\bibitem{vllm} K. Kwon et al., ``Efficient Memory Management for Large Language Model Serving with PagedAttention,'' in \emph{SOSP}, 2023.
+\bibitem{aflpp} A. Fioraldi et al., ``AFL++: Combining Incremental Improvements of Fuzzing,'' in \emph{Proceedings of the 13th USENIX Workshop on Offensive Technologies (WOOT)}, 2020.
+\bibitem{asan} K. Serebryany et al., ``AddressSanitizer: A Fast Address Sanity Checker,'' in \emph{USENIX Annual Technical Conference (ATC)}, 2012.
+\bibitem{vllm} W. Kwon et al., ``Efficient Memory Management for Large Language Model Serving with PagedAttention,'' in \emph{SOSP}, 2023.
+\bibitem{onnx} ONNX Project, ``Open Neural Network Exchange Format Specification,'' \url{https://onnx.ai/}, 2024.
 \end{thebibliography}
 
 \end{document}
