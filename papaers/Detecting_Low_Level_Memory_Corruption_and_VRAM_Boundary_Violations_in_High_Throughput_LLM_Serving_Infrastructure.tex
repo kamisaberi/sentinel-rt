@@ -1,24 +1,36 @@
-\documentclass[10pt,twocolumn,a4paper]{article}
+\documentclass[11pt,a4paper]{article}
 \usepackage[utf8]{utf8}
-\usepackage[margin=0.7in]{geometry}
+\usepackage[margin=0.9in]{geometry}
 \usepackage{amsmath,amsfonts,amssymb}
 \usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage{listings}
 \usepackage{booktabs}
 \usepackage{xcolor}
+\usepackage{cite}
+\usepackage{setspace}
+
+\setstretch{1.15}
 
 \hypersetup{
     colorlinks=true,
     linkcolor=blue,
-    citecolor=blue,
-    urlcolor=blue
+    citecolor=blue,urlcolor=blue
 }
 
-\title{\textbf{Detecting Low-Level Memory Corruption and VRAM Boundary Violations in High-Throughput LLM Serving Infrastructure}}
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!60!black},
+    stringstyle=\color{orange}
+}
+
+\title{\Large\bfseries Detecting Low-Level Memory Corruption and VRAM Boundary Violations in High-Throughput LLM Serving Infrastructure}
 
 \author{
-    \textbf{Kamran Saberifard}\\
+    \textbf{Kamran Saberifard}\\[4pt]
     Department of Computer Engineering (Cybersecurity), MehrAstan University, Guilan, Iran\\
     Aryorithm Group — Global AI Infrastructure \& Security Research\\
     \href{mailto:kamisaberi@gmail.com}{kamisaberi@gmail.com} \quad|\quad ORCID: \href{https://orcid.org/0009-0002-7822-6168}{0009-0002-7822-6168}
@@ -31,55 +43,60 @@
 \maketitle
 
 \begin{abstract}
-High-throughput Large Language Model (LLM) serving frameworks, such as \texttt{vLLM}, \texttt{TensorRT-LLM}, and \texttt{Triton Inference Server}, rely on custom C++ and CUDA memory management architectures to maximize token generation throughput and minimize latency. Mechanisms like PagedAttention, dynamic KV-cache block allocation, and custom CUDA caching allocators achieve near-optimal memory utilization, but they trade compile-time memory safety for raw execution performance. As a result, subtle low-level memory corruption bugs—including VRAM out-of-bounds (OOB) writes, double-free conditions in custom tensor views, and cross-session memory leakage—can compromise multi-tenant GPU clusters or lead to silent data corruption. In this paper, we propose a lightweight, dynamic VRAM boundary auditor and shadow-memory tracking architecture designed specifically for native GPU AI execution backends. Our system intercepts low-level CUDA memory allocations, injects unaddressable VRAM redzone guard bands, and maintains a thread-safe host-device allocation map. Experimental results demonstrate that our detection framework identifies 100\% of simulated out-of-bounds VRAM accesses and double-free conditions while imposing an acceptable latency penalty of less than 3.4\% on enterprise LLM serving workloads.
+\noindent High-throughput Large Language Model (LLM) serving frameworks—such as \texttt{vLLM}, \texttt{TensorRT-LLM}, \texttt{Ollama}, and \texttt{Triton Inference Server}—rely heavily on native C++ and custom CUDA memory management architectures to maximize token generation throughput and satisfy sub-50ms Time-to-First-Token (TTFT) Service Level Agreements (SLAs). Mechanisms like PagedAttention, dynamic Key-Value (KV) cache block allocation, and custom CUDA caching allocators achieve near-optimal GPU VRAM utilization, but they trade compile-time memory safety for raw execution performance. Consequently, subtle low-level memory corruption bugs—including VRAM out-of-bounds (OOB) writes during warp-level index calculations, Use-After-Free (UAF) conditions in custom tensor views, and cross-session memory leakage—can compromise multi-tenant GPU clusters or cause silent data corruption. In this paper, we present a dynamic VRAM boundary auditor and shadow-memory tracking architecture designed specifically for high-throughput GPU AI execution backends. Our system intercepts low-level CUDA memory allocations, injects unaddressable VRAM redzone guard bands around usable tensor payloads, and maintains a thread-safe host-device allocation map. Experimental results demonstrate that our detection framework achieves a 100\% detection rate against simulated out-of-bounds VRAM accesses and double-free conditions while imposing an acceptable latency overhead of less than 3.4\% on enterprise LLM serving workloads.
 \end{abstract}
 
-\textbf{Keywords:} LLM Serving Security, CUDA Memory Safety, VRAM Boundary Detection, PagedAttention, KV-Cache Security, GPU Memory Corruption.
+\vspace{6pt}
+\noindent\textbf{Keywords:} LLM Serving Security, CUDA Memory Safety, VRAM Boundary Detection, PagedAttention, KV-Cache Security, GPU Memory Corruption, AddressSanitizer.
+
+\hr
 
 \section{Introduction}
-Enterprise deployment of Large Language Models (LLMs) requires ultra-low-latency and high-concurrency serving infrastructure. To satisfy strict Service Level Agreements (SLAs), modern serving frameworks have abandoned high-level runtime environments in favor of compiled native C++ and custom CUDA execution backends.
+Enterprise deployment of Large Language Models (LLMs) requires ultra-low-latency and high-concurrency serving infrastructure. To satisfy strict production SLAs, modern serving frameworks have abandoned high-level runtime environments in favor of compiled native C++ engines and custom CUDA execution backends.
 
 Key optimizations like \textbf{PagedAttention}~\cite{vllm} fragment GPU Virtual Random Access Memory (VRAM) into non-contiguous physical pages to eliminate external memory fragmentation during long-context generation. Similarly, high-performance CUDA caching allocators bypass standard driver calls (\texttt{cudaMalloc}) by maintaining custom in-memory block pools.
 
 However, these performance-critical abstractions introduce significant memory safety risks:
 \begin{enumerate}
-    \item \textbf{Manual Pointer Arithmetic in CUDA Kernels:} Custom attention mechanisms rely on manual thread-index calculations that can overflow or read past allocated block boundaries.
+    \item \textbf{Manual Pointer Arithmetic in CUDA Kernels:} Custom attention mechanisms rely on manual thread-index calculations that can overflow or read past allocated block boundaries during high-concurrency prompt decoding.
     \item \textbf{Lack of Hardware Guard Bands in VRAM:} Unlike CPU architectures equipped with virtual memory page tables and AddressSanitizer (ASan) support, GPU VRAM allocation lacks dynamic boundary redzones by default.
     \item \textbf{Cross-Session Data Leakage:} In multi-tenant GPU clusters, un-poisoned freed VRAM blocks can leak sensitive prompt context or model activations across user sessions.
 \end{enumerate}
 
 To address these vulnerabilities, we introduce a dynamic VRAM boundary auditor that transparently tracks GPU memory allocations, injects unaddressable guard bands, and detects dynamic memory corruption in real-time.
 
-\section{Vulnerability Landscape in VRAM}
+\begin{figure}[h!]
+\centering
+\fbox{\parbox{0.88\linewidth}{
+\small
+\textbf{[ LLM Serving Engine (\texttt{vLLM} / \texttt{TensorRT-LLM}) ]}\\
+$\Downarrow$ \textit{(Intercepted Allocation Request)}\\
+\textbf{[ C++20 Interception Layer (\texttt{CUDASanitizer}) ]}\\
+$\Downarrow$ \textit{(Inject Front and Back Redzone Guard Bands)}\\
+\textbf{[ Physical GPU Device VRAM Allocation ]}\\
+\texttt{[ Redzone (256B) | Usable Tensor Payload | Redzone (256B) ]}\\
+$\Downarrow$ \textit{(OOB Access Intercepted)}\\
+\textbf{\textcolor{red}{[ BOUNDARY VIOLATION DETECTED: Execution Halts ]}}
+}}
+\caption{VRAM Redzone Injection and Memory Boundary Detection Architecture.}
+\label{fig:vram_arch}
+\end{figure}
+
+\section{VRAM Memory Corruption Mechanics \& Threat Surface}
 
 \subsection{PagedAttention Block Offsets}
 In PagedAttention, the Key-Value (KV) cache is divided into fixed-size physical blocks (e.g., 16 or 32 tokens). The device kernel maps logical token indices to physical block addresses via lookup tables:
 \begin{equation}
-\text{Addr}(t) = \text{Base}_{\text{block}(t)} + \left( t \bmod S_{\text{block}} \right) \times D_{\text{head}} \times 2 \times \text{bytes}
+\text{Addr}(t) = \text{Base}_{\text{block}(t)} + \left( t \bmod S_{\text{block}} \right) \times D_{\text{head}} \times 2 \times \text{bytes\_per\_elem}
 \end{equation}
 An integer overflow or off-by-one error in $t$ causes the CUDA thread warp to write past the allocated block, corrupting adjacent KV-cache blocks belonging to other active user sessions.
 
 \subsection{Custom CUDA Caching Allocator Flaws}
 Frameworks often manage a global pool of pre-allocated GPU VRAM to avoid expensive CUDA driver API calls. When slicing tensor views or releasing intermediate activation buffers, race conditions or invalid pointer calculations can result in Use-After-Free (UAF) or double-free conditions inside VRAM.
 
-\section{System Architecture}
+\section{System Architecture \& Detection Methodology}
 
 Our detection system consists of three core components operating transparently between the LLM serving framework and the CUDA driver API:
-
-\begin{figure}[h]
-\centering
-\fbox{\parbox{0.9\linewidth}{
-\centering
-\textbf{[ LLM Serving Engine (vLLM / TensorRT) ]}\\
-$\Downarrow$ \small{(Intercepted Allocation Request)}\\
-\textbf{[ Interception Layer (\texttt{CUDASanitizer}) ]}\\
-$\Downarrow$ \small{(Inject Front/Back Redzones)}\\
-\textbf{[ Physical GPU VRAM Allocation ]}\\
-\small{\texttt{[ Redzone | Usable Payload | Redzone ]}}
-}}
-\caption{VRAM Redzone Injection and Allocation Architecture.}
-\label{fig:arch}
-\end{figure}
 
 \subsection{1. API Interception \& Allocation Wrapping}
 The system intercepts \texttt{cudaMalloc} requests and expands the requested allocation size $S_{\text{req}}$ to include symmetric front and back guard bands ($R_{\text{bytes}}$):
@@ -107,10 +124,11 @@ If $P_{\text{access}}$ falls inside $R_{\text{bytes}}$ or hits a poisoned block 
 \section{Implementation Details}
 The detector is implemented in C++20 and CUDA 12. It provides native wrappers for \texttt{cudaMalloc}, \texttt{cudaFree}, and \texttt{cudaMemset}.
 
-\begin{lstlisting}[language=C++, caption={VRAM Allocation & Redzone Injection Logic}]
+\begin{lstlisting}[language=C++, caption={VRAM Allocation \& Redzone Injection Logic}]
 Status CUDASanitizer::audit_malloc(
     void** dev_ptr, 
     size_t size, 
+    std::string_view label,
     size_t redzone_bytes) 
 {
   size_t total = size + (redzone_bytes * 2);
@@ -125,7 +143,7 @@ Status CUDASanitizer::audit_malloc(
   uintptr_t raw_addr = reinterpret_cast<uintptr_t>(raw_ptr);
   *dev_ptr = reinterpret_cast<void*>(raw_addr + redzone_bytes);
 
-  register_region(*dev_ptr, size, redzone_bytes);
+  register_region(*dev_ptr, size, redzone_bytes, label);
   return Status::Success;
 }
 \end{lstlisting}
@@ -133,13 +151,14 @@ Status CUDASanitizer::audit_malloc(
 \section{Experimental Evaluation}
 We evaluated the framework on an NVIDIA RTX 4090 GPU (24 GB VRAM) running synthetic benchmarks and a modified \texttt{vLLM} serving instance processing Llama-3-8B model inference workloads.
 
-\begin{table}[h]
+\begin{table}[h!]
 \centering
 \caption{Performance and Detection Efficiency Metrics}
 \label{tab:results}
+\vspace{4pt}
 \begin{tabular}{lcc}
 \toprule
-\textbf{Metric} & \textbf{Baseline} & \textbf{With Auditor} \\
+\textbf{Metric} & \textbf{Baseline (Stock vLLM)} & \textbf{With VRAM Auditor} \\
 \midrule
 Time-to-First-Token (TTFT) & 18.2 ms & 18.7 ms (+2.7\%) \\
 Decoding Throughput        & 112 tok/s & 108 tok/s (-3.5\%) \\
@@ -155,7 +174,7 @@ As shown in Table~\ref{tab:results}, injecting 256-byte redzones around KV-cache
 \section{Related Work}
 Previous works on GPU memory security focused primarily on host-side memory bounds or general CUDA profiling tools like NVIDIA Compute Sanitizer (\texttt{sanitizer-api}). However, standard tools are designed for offline debugging rather than continuous, real-time auditing in high-throughput production LLM serving clusters. Our work fills this gap by introducing zero-copy dynamic boundary checking optimized for LLM KV-cache architectures.
 
-\section{Conclusion}
+\section{Conclusion \& Future Work}
 Native C++/CUDA LLM serving infrastructure achieves exceptional throughput at the cost of low-level memory safety risks. Our dynamic VRAM boundary auditor introduces lightweight shadow tracking and redzone guard bands that detect VRAM buffer overflows and double-free conditions in real-time with minimal latency impact. Future work will extend this framework to support hardware-enforced memory isolation inside NVIDIA Confidential Computing TEEs.
 
 \begin{thebibliography}{99}
